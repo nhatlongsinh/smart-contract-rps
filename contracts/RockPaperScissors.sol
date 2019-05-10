@@ -12,7 +12,7 @@ contract RockPaperScissors is Stoppable {
 
     struct Game {
         uint256 betAmount;
-        uint256 revealExpiredBlock;
+        uint256 deadlineBlock;
         bytes32 opponentHash; // hash of real move + secret
         Move creatorMove;
         Move opponentMove;
@@ -22,10 +22,9 @@ contract RockPaperScissors is Stoppable {
     }
 
     // PRIVATE VARIABLES
-    // after the first player revealing his move, the second player needs to do the same
-    // within the revealing duration period
-    // otherwise the first player is the winner and can claim the fund
-    uint256 public revealingDuration;
+    // deadline duration serves as duration after which game creator has to wait to cancel his game
+    // as well as the duration within which the player 2 has to reveal his move
+    uint256 public deadlineDuration;
     // game id is creatorHash
     mapping(bytes32 => Game) public games;
     mapping(address => uint256) public balances;
@@ -56,23 +55,20 @@ contract RockPaperScissors is Stoppable {
 
     event BalanceWithdrawed(address indexed sender, uint256 amount);
 
-    event RevealingDurationChanged(address indexed sender, uint256 newValue);
+    event DeadlineDurationChanged(address indexed sender, uint256 newValue);
 
-    constructor(bool isRunning, uint256 _revealingDuration)
+    constructor(bool isRunning, uint256 _deadlineDuration)
         public
         Stoppable(isRunning)
     {
-        require(_revealingDuration > 0, "revealing duration must greater than zero");
-        revealingDuration = _revealingDuration;
-
-        emit RevealingDurationChanged(msg.sender, _revealingDuration);
+        setDeadlineDuration(_deadlineDuration);
     }
 
-    function setRevealingDuration(uint256 _revealingDuration) public {
-        require(_revealingDuration > 0, "revealing duration must greater than zero");
-        revealingDuration = _revealingDuration;
+    function setDeadlineDuration(uint256 _deadlineDuration) public ownerOnly {
+        require(_deadlineDuration > 0, "deadline duration must greater than zero");
+        deadlineDuration = _deadlineDuration;
 
-        emit RevealingDurationChanged(msg.sender, _revealingDuration);
+        emit DeadlineDurationChanged(msg.sender, _deadlineDuration);
     }
 
     // creator create a new game by submitting his hashMove and opponent address
@@ -94,11 +90,13 @@ contract RockPaperScissors is Stoppable {
     function play(bytes32 gameId, bytes32 hashMove) public payable runningOnly {
         Game memory game = games[gameId];
 
-        require(game.opponent == msg.sender, "Cannot play this game");
+        require(game.opponent == msg.sender, "You are not the player");
         require(game.opponentHash == bytes32(0), "Opponent already played");
         require(game.betAmount == msg.value, "Amount is invalid");
 
         games[gameId].opponentHash = hashMove;
+        // this deadline block is for cancel period
+        games[gameId].deadlineBlock = block.number.add(deadlineDuration);
 
         emit GamePlayed(msg.sender, gameId, hashMove);
     }
@@ -107,13 +105,17 @@ contract RockPaperScissors is Stoppable {
     function revealGame(bytes32 gameId, Move move, bytes32 secret) public runningOnly {
         Game memory game = games[gameId];
 
+        require(move != Move.Unset, "Only Rock, Paper, or Scissors allowed");
         require(game.opponentHash != bytes32(0), "Opponent has not played yet");
-        require(game.creator == msg.sender || game.opponent == msg.sender,
-            "Cannot play this game");
-
+        
         // only check revealing expire block when the first player already reveal
         if(game.firstRevealer != address(0)) {
-            require(game.revealExpiredBlock >= block.number, "Revealing period is expired");
+            require(game.deadlineBlock >= block.number, "Revealing period is expired");
+        } else {
+            // set first revealer & set revealing expired block
+            games[gameId].firstRevealer = msg.sender;
+            // this deadline block is for revealing period
+            games[gameId].deadlineBlock = block.number.add(deadlineDuration);
         }
 
         bytes32 hashMove = generateHash(msg.sender, move, secret);
@@ -124,17 +126,13 @@ contract RockPaperScissors is Stoppable {
             require(game.creatorMove == Move.Unset, "Move already revealed");
             games[gameId].creatorMove = move;
             game.creatorMove = move;
-        } else {
+        } else if(game.opponent == msg.sender) {
             require(game.opponentHash == hashMove, "Invalid game move");
             require(game.opponentMove == Move.Unset, "Move already revealed");
             games[gameId].opponentMove = move;
             game.opponentMove = move;
-        }
-
-        // set first revealer & set revealing expired block
-        if(game.firstRevealer == address(0)){
-            games[gameId].firstRevealer = msg.sender;
-            games[gameId].revealExpiredBlock = block.number.add(revealingDuration);
+        } else {
+            revert("You are not the player");
         }
 
         emit GameRevealed(msg.sender, gameId, move, secret);
@@ -156,6 +154,8 @@ contract RockPaperScissors is Stoppable {
                     winner = game.creator;
                 } else if(result < 0) {
                     winner = game.opponent;
+                } else {
+                    assert(false);
                 }
                 
                 // winner receive reward
@@ -167,7 +167,7 @@ contract RockPaperScissors is Stoppable {
             // clear storage
             Game storage endGame = games[gameId];
             endGame.betAmount = 0;
-            endGame.revealExpiredBlock = 0;
+            endGame.deadlineBlock = 0;
             endGame.opponentHash = 0;
             endGame.creatorMove = Move.Unset;
             endGame.opponentMove = Move.Unset;
@@ -178,21 +178,21 @@ contract RockPaperScissors is Stoppable {
         }
     }
 
-    // first revealer can claim expired game if the second player has not revealed
+    // Play 1 can claim the price if player 2 does not reveal his move with the revealing period
     function claimExpiredGame(bytes32 gameId) public runningOnly {
         // clear storage
         Game storage endGame = games[gameId];
 
         require(endGame.firstRevealer == msg.sender, "Only first revealer can claim");
         require(endGame.creatorMove == Move.Unset || endGame.opponentMove == Move.Unset, "Both players have revealed their moves");
-        require(endGame.revealExpiredBlock < block.number, "Game is not expired");
+        require(endGame.deadlineBlock < block.number, "Game is not expired");
 
         if(endGame.betAmount > 0) {
             balances[msg.sender] = balances[msg.sender].add(endGame.betAmount.mul(2));
         }
         
         endGame.betAmount = 0;
-        endGame.revealExpiredBlock = 0;
+        endGame.deadlineBlock = 0;
         endGame.opponentHash = 0;
         endGame.creatorMove = Move.Unset;
         endGame.opponentMove = Move.Unset;
@@ -203,14 +203,15 @@ contract RockPaperScissors is Stoppable {
     }
 
     // cancel game only if Opponent has not played yet
-    function cancelGame(bytes32 gameId) public runningOnly{
+    function cancelGame(bytes32 gameId) public runningOnly {
         Game memory game = games[gameId];
 
         require(game.creator == msg.sender, "Only owner can cancel this game");
         require(game.opponentHash == bytes32(0), "Opponent already played");
+        require(game.deadlineBlock < block.number, "Cancel is not available");
 
         games[gameId].betAmount = 0;
-        games[gameId].opponentHash = bytes32(0);
+        games[gameId].deadlineBlock = 0;
 
         if(game.betAmount > 0)
             balances[msg.sender] = balances[msg.sender].add(game.betAmount);
@@ -230,7 +231,7 @@ contract RockPaperScissors is Stoppable {
 
         msg.sender.transfer(balance);
     }
-
+    
     // 0: even, 1: player1 win, -1: player2 win
     function calculateResult(Move move1, Move move2) public pure returns(int256 result) {
         if(move1 == move2) {
@@ -253,6 +254,8 @@ contract RockPaperScissors is Stoppable {
             } else if(move2 == Move.Paper) {
                 result = 1;
             }
+        } else {
+            assert(false);
         }
     }
 
